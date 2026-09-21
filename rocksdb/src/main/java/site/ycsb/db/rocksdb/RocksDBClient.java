@@ -27,7 +27,10 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.file.*;
+import java.security.MessageDigest; // [YW-Custom]
+import java.security.NoSuchAlgorithmException; // [YW-Custom]
 import java.util.*;
+import java.util.Locale; // [YW-Custom]
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.Lock;
@@ -53,6 +56,28 @@ public class RocksDBClient extends DB {
   @GuardedBy("RocksDBClient.class") private static RocksObject dbOptions = null;
   @GuardedBy("RocksDBClient.class") private static RocksDB rocksDb = null;
   @GuardedBy("RocksDBClient.class") private static int references = 0;
+
+  // [YW-Custom] CF-level options set during initRocksDB(); applied in createColumnFamily() as well.
+  @GuardedBy("RocksDBClient.class") private static int  cfNumLevels             = -1;
+  @GuardedBy("RocksDBClient.class") private static long cfMaxBytesForLevelBase  = -1L;
+  @GuardedBy("RocksDBClient.class") private static int  cfLevel0CompactionTrigger = -1;
+  @GuardedBy("RocksDBClient.class") private static int  cfLevel0SlowdownTrigger   = -1;
+  @GuardedBy("RocksDBClient.class") private static int  cfLevel0StopTrigger       = -1;
+  // [YW-Custom] Additional CF-level options the upstream binding silently ignored.
+  @GuardedBy("RocksDBClient.class") private static int  cfMaxWriteBufferNumber  = -1;
+  @GuardedBy("RocksDBClient.class") private static CompressionType cfCompression = null;
+
+  // [YW-Custom] Extra CF/table options (memtable size, level geometry, block cache, bloom filter).
+  // Added 2026-09 after the audit found the standard panel had run with filter_policy=nullptr on
+  // both systems and an optimizeLevelStyleCompaction() preset silently overriding RocksDB defaults.
+  @GuardedBy("RocksDBClient.class") private static YwExtraOpts cfExtra = new YwExtraOpts();
+  // Block cache and filter policy are native objects shared by every CF. They must stay strongly
+  // referenced for the lifetime of the DB, otherwise the JVM finalizes them underneath us.
+  @GuardedBy("RocksDBClient.class") private static Cache sharedBlockCache = null;
+  @GuardedBy("RocksDBClient.class") private static Filter sharedFilterPolicy = null;
+
+  // [YW-Custom] WriteOptions reused for every put/delete; set during init based on rocksdb.disablewal.
+  @GuardedBy("RocksDBClient.class") private static WriteOptions writeOptions = null;
 
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
@@ -97,12 +122,17 @@ public class RocksDBClient extends DB {
       Files.createDirectories(rocksDbDir);
     }
 
+    // [YW-Custom] Initialize WriteOptions for the options-file path too, so put/delete don't NPE.
+    final boolean disableWal = parseBoolProp("rocksdb.disablewal", false);
+    writeOptions = new WriteOptions().setDisableWAL(disableWal);
+
     final DBOptions options = new DBOptions();
     final List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
     final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
 
     RocksDB.loadLibrary();
-    OptionsUtil.loadOptionsFromFile(optionsFile.toAbsolutePath().toString(), Env.getDefault(), options, cfDescriptors);
+    final ConfigOptions configOptions = new ConfigOptions();
+    OptionsUtil.loadOptionsFromFile(configOptions, optionsFile.toAbsolutePath().toString(), options, cfDescriptors);
     dbOptions = options;
 
     final RocksDB db = RocksDB.open(options, rocksDbDir.toAbsolutePath().toString(), cfDescriptors, cfHandles);
@@ -130,13 +160,62 @@ public class RocksDBClient extends DB {
       Files.createDirectories(rocksDbDir);
     }
 
+    // [YW-Custom] Force native library load before constructing any RocksDB class. WriteOptions
+    // and other lightweight option classes do not have their own static loadLibrary() block, so
+    // they would NPE/UnsatisfiedLinkError if instantiated before Options triggers the auto-load.
+    RocksDB.loadLibrary();
+
+    // [YW-Custom] Read all configurable properties once; apply to every CF opened or created below.
+    final int numLevels             = parseIntProp("rocksdb.numlevels", -1);
+    final long maxBytesForLevelBase = parseLongProp("rocksdb.maxbytesforlevelbase", -1L);
+    final int l0Trigger  = parseIntProp("rocksdb.level0compactiontrigger", -1);
+    final int l0Slowdown = parseIntProp("rocksdb.level0slowdowntrigger", -1);
+    final int l0Stop     = parseIntProp("rocksdb.level0stoptrigger", -1);
+    final int maxWriteBufferNumber = parseIntProp("rocksdb.maxwritebuffernumber", -1);
+    final CompressionType compression = parseCompressionProp("rocksdb.compression", null);
+    final boolean useDirectReads = parseBoolProp("rocksdb.use_direct_reads", false);
+    final boolean useDirectIoForFlushAndCompaction =
+        parseBoolProp("rocksdb.use_direct_io_for_flush_and_compaction", false);
+    final boolean disableWal = parseBoolProp("rocksdb.disablewal", false);
+    cfNumLevels            = numLevels;
+    cfMaxBytesForLevelBase = maxBytesForLevelBase;
+    cfLevel0CompactionTrigger = l0Trigger;
+    cfLevel0SlowdownTrigger   = l0Slowdown;
+    cfLevel0StopTrigger       = l0Stop;
+    cfMaxWriteBufferNumber = maxWriteBufferNumber;
+    cfCompression          = compression;
+
+    // [YW-Custom] Extra options. -1 / -1L / null all mean "leave the RocksDB default alone".
+    // Note the deliberate distinction for bloombits: -1 = untouched (RocksDB default is nullptr),
+    // 0 = explicitly no filter. The ITBL arm sets 0 because its L0 is indexed by the interval
+    // table; the baseline arm sets 10. That asymmetry is a DESIGN difference, not a control leak
+    // (see test_scripts/TEST_OVERVIEW.md, read_perf 'controlled vs design' table).
+    cfExtra = new YwExtraOpts(getProperties());
+
+    LOGGER.info("[YW-Custom] options summary: numLevels={} maxBytesForLevelBase={} l0Trigger={} "
+        + "l0Slowdown={} l0Stop={} maxWriteBufferNumber={} compression={} useDirectReads={} "
+        + "useDirectIoForFlushAndCompaction={} disableWal={}",
+        numLevels, maxBytesForLevelBase, l0Trigger, l0Slowdown, l0Stop,
+        maxWriteBufferNumber, compression, useDirectReads,
+        useDirectIoForFlushAndCompaction, disableWal);
+    LOGGER.info("[YW-Custom] extra options summary: {}", cfExtra);
+
+    writeOptions = new WriteOptions().setDisableWAL(disableWal);
+
     final List<String> cfNames = loadColumnFamilyNames();
     final List<ColumnFamilyOptions> cfOptionss = new ArrayList<>();
     final List<ColumnFamilyDescriptor> cfDescriptors = new ArrayList<>();
 
+    final CfOpts cfo = new CfOpts(numLevels, maxBytesForLevelBase,
+        l0Trigger, l0Slowdown, l0Stop, maxWriteBufferNumber, compression);
     for(final String cfName : cfNames) {
-      final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions()
-          .optimizeLevelStyleCompaction();
+      // [YW-Custom] optimizeLevelStyleCompaction() removed 2026-09. It pre-set write_buffer_size
+      // (128MB), max_write_buffer_number (6), level0_file_num_compaction_trigger (2) and
+      // max_bytes_for_level_base (512MB), so the baseline arm was never running "RocksDB default".
+      // Anything not given as a property now keeps the genuine RocksDB default.
+      final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
+      cfo.applyTo(cfOptions);
+      cfExtra.applyTo(cfOptions);
       final ColumnFamilyDescriptor cfDescriptor = new ColumnFamilyDescriptor(
           cfName.getBytes(UTF_8),
           cfOptions
@@ -145,25 +224,72 @@ public class RocksDBClient extends DB {
       cfDescriptors.add(cfDescriptor);
     }
 
-    final int rocksThreads = Runtime.getRuntime().availableProcessors() * 2;
+    final int rocksThreads  = Runtime.getRuntime().availableProcessors() * 2;
+    final int bgCompactions = parseIntProp("rocksdb.maxbackgroundcompactions", rocksThreads);
+    final int bgFlushes     = parseIntProp("rocksdb.maxbackgroundflushes",     -1);
+    final int parallelism   = parseIntProp("rocksdb.increaseparallelism",      rocksThreads);
 
     if(cfDescriptors.isEmpty()) {
+      // [YW-Custom] optimizeLevelStyleCompaction() removed 2026-09 — see the CF-descriptor path above.
       final Options options = new Options()
-          .optimizeLevelStyleCompaction()
           .setCreateIfMissing(true)
           .setCreateMissingColumnFamilies(true)
-          .setIncreaseParallelism(rocksThreads)
-          .setMaxBackgroundCompactions(rocksThreads)
+          .setIncreaseParallelism(parallelism)
+          .setMaxBackgroundCompactions(bgCompactions)
           .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
+      if (bgFlushes > 0) {
+        options.setMaxBackgroundFlushes(bgFlushes);
+      }
+      // [YW-Custom] DB-level direct I/O knobs (Options extends DBOptions).
+      if (useDirectReads) {
+        options.setUseDirectReads(true);
+      }
+      if (useDirectIoForFlushAndCompaction) {
+        options.setUseDirectIoForFlushAndCompaction(true);
+      }
+      // [YW-Custom] CF-level overrides (Options also extends ColumnFamilyOptions setters).
+      if (numLevels > 0) {
+        options.setNumLevels(numLevels);
+      }
+      if (maxBytesForLevelBase > 0) {
+        options.setMaxBytesForLevelBase(maxBytesForLevelBase);
+      }
+      if (l0Trigger >= 0) {
+        options.setLevel0FileNumCompactionTrigger(l0Trigger);
+      }
+      if (l0Slowdown >= 0) {
+        options.setLevel0SlowdownWritesTrigger(l0Slowdown);
+      }
+      if (l0Stop >= 0) {
+        options.setLevel0StopWritesTrigger(l0Stop);
+      }
+      if (maxWriteBufferNumber > 0) {
+        options.setMaxWriteBufferNumber(maxWriteBufferNumber);
+      }
+      applyCompression(options, compression, numLevels);
+      // [YW-Custom] memtable / level geometry / block cache / bloom filter.
+      cfExtra.applyTo(options);
+      applyMaxOpenFiles(options, getProperties());
       dbOptions = options;
       return RocksDB.open(options, rocksDbDir.toAbsolutePath().toString());
     } else {
       final DBOptions options = new DBOptions()
           .setCreateIfMissing(true)
           .setCreateMissingColumnFamilies(true)
-          .setIncreaseParallelism(rocksThreads)
-          .setMaxBackgroundCompactions(rocksThreads)
+          .setIncreaseParallelism(parallelism)
+          .setMaxBackgroundCompactions(bgCompactions)
           .setInfoLogLevel(InfoLogLevel.INFO_LEVEL);
+      if (bgFlushes > 0) {
+        options.setMaxBackgroundFlushes(bgFlushes);
+      }
+      // [YW-Custom] DB-level direct I/O knobs.
+      if (useDirectReads) {
+        options.setUseDirectReads(true);
+      }
+      if (useDirectIoForFlushAndCompaction) {
+        options.setUseDirectIoForFlushAndCompaction(true);
+      }
+      applyMaxOpenFiles(options, getProperties());
       dbOptions = options;
 
       final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
@@ -175,6 +301,349 @@ public class RocksDBClient extends DB {
     }
   }
 
+  // [YW-Custom] Self-applying holder for all configurable CF options. Encapsulates the values and
+  // the logic to apply them to a ColumnFamilyOptions instance. -1 / -1L / null means "leave default".
+  private static final class CfOpts {
+    private final int numLevels;
+    private final long maxBytesForLevelBase;
+    private final int l0Trigger;
+    private final int l0Slowdown;
+    private final int l0Stop;
+    private final int maxWriteBufferNumber;
+    private final CompressionType compression;
+
+    CfOpts(final int numLevels, final long maxBytesForLevelBase,
+           final int l0Trigger, final int l0Slowdown, final int l0Stop,
+           final int maxWriteBufferNumber, final CompressionType compression) {
+      this.numLevels = numLevels;
+      this.maxBytesForLevelBase = maxBytesForLevelBase;
+      this.l0Trigger = l0Trigger;
+      this.l0Slowdown = l0Slowdown;
+      this.l0Stop = l0Stop;
+      this.maxWriteBufferNumber = maxWriteBufferNumber;
+      this.compression = compression;
+    }
+
+    void applyTo(final ColumnFamilyOptions opts) {
+      if (numLevels > 0) {
+        opts.setNumLevels(numLevels);
+      }
+      if (maxBytesForLevelBase > 0) {
+        opts.setMaxBytesForLevelBase(maxBytesForLevelBase);
+      }
+      if (l0Trigger >= 0) {
+        opts.setLevel0FileNumCompactionTrigger(l0Trigger);
+      }
+      if (l0Slowdown >= 0) {
+        opts.setLevel0SlowdownWritesTrigger(l0Slowdown);
+      }
+      if (l0Stop >= 0) {
+        opts.setLevel0StopWritesTrigger(l0Stop);
+      }
+      if (maxWriteBufferNumber > 0) {
+        opts.setMaxWriteBufferNumber(maxWriteBufferNumber);
+      }
+      if (compression != null) {
+        opts.setCompressionType(compression);
+        // [YW-Custom] optimizeLevelStyleCompaction() pre-populates compression_per_level (LZ4 at L2+).
+        // The per-level array takes precedence over setCompressionType, so we must override it too,
+        // otherwise compression=NO_COMPRESSION only takes effect at L0/L1.
+        final int effectiveNumLevels = numLevels > 0 ? numLevels : 7;
+        final List<CompressionType> perLevel = new ArrayList<>(effectiveNumLevels);
+        for (int i = 0; i < effectiveNumLevels; i++) {
+          perLevel.add(compression);
+        }
+        opts.setCompressionPerLevel(perLevel);
+      }
+    }
+  }
+
+  // [YW-Custom] Self-applying holder for the options the upstream binding (and our earlier patch)
+  // left at whatever optimizeLevelStyleCompaction() happened to set. Everything is tri-state:
+  // -1 / -1L / -1.0 / null mean "do not touch, keep the RocksDB default".
+  //
+  // Why this exists: the 2026-05 standard panel ran with filter_policy=nullptr on BOTH systems
+  // because no property reached BlockBasedTableConfig, and with write_buffer_size=128MB /
+  // max_write_buffer_number=6 / level0_file_num_compaction_trigger=2 / max_bytes_for_level_base=512MB
+  // because the preset set them. None of that was visible in the scripts.
+  private static final class YwExtraOpts {
+    private final long writeBufferSize;
+    private final long targetFileSizeBase;
+    private final double maxBytesForLevelMultiplier;
+    private final Boolean levelDynamicBytes;
+    private final long softPendingLimit;
+    private final long hardPendingLimit;
+    private final double bloomBits;
+    private final long cacheSize;
+    private final boolean cacheIndexAndFilterBlocks;
+    private final boolean pinL0FilterAndIndexBlocks;
+    private final long blockSize;
+    private final double cacheHighPriRatio;
+    private final boolean cacheIndexAndFilterWithHighPriority;
+
+    // Empty holder used before init(); every field is "leave the RocksDB default alone".
+    YwExtraOpts() {
+      this(new Properties());
+    }
+
+    // Parses itself from the YCSB properties. Taking the whole Properties keeps the checkstyle
+    // ParameterNumber rule happy and keeps the property names next to the fields they set.
+    YwExtraOpts(final Properties props) {
+      this.writeBufferSize = longProp(props, "rocksdb.writebuffersize", -1L);
+      this.targetFileSizeBase = longProp(props, "rocksdb.targetfilesizebase", -1L);
+      this.maxBytesForLevelMultiplier = doubleProp(props, "rocksdb.maxbytesforlevelmultiplier", -1.0);
+      this.levelDynamicBytes = boolPropOrNull(props, "rocksdb.leveldynamicbytes");
+      this.softPendingLimit = longProp(props, "rocksdb.softpendingcompactionbyteslimit", -1L);
+      this.hardPendingLimit = longProp(props, "rocksdb.hardpendingcompactionbyteslimit", -1L);
+      this.bloomBits = doubleProp(props, "rocksdb.bloombits", -1.0);
+      this.cacheSize = longProp(props, "rocksdb.cachesize", -1L);
+      this.cacheIndexAndFilterBlocks = boolProp(props, "rocksdb.cacheindexandfilterblocks", false);
+      this.pinL0FilterAndIndexBlocks =
+          boolProp(props, "rocksdb.pinl0filterandindexblocksincache", false);
+      this.blockSize = longProp(props, "rocksdb.blocksize", -1L);
+      // Java's LRUCache(capacity) convenience constructor passes highPriPoolRatio=0.0
+      // (LRUCache.java:19) — NOT the C++ LRUCacheOptions default of 0.5. With 0.0 there is no
+      // high-priority pool, so index/filter blocks are evicted by streaming data-block reads
+      // even when cache_index_and_filter_blocks_with_high_priority is true. Always state it.
+      this.cacheHighPriRatio = doubleProp(props, "rocksdb.cachehighpriratio", 0.0);
+      this.cacheIndexAndFilterWithHighPriority =
+          boolProp(props, "rocksdb.cacheindexandfilterblockswithhighpriority", true);
+    }
+
+    private static long longProp(final Properties p, final String k, final long dflt) {
+      final String v = p.getProperty(k);
+      return v != null ? Long.parseLong(v.trim()) : dflt;
+    }
+
+    private static double doubleProp(final Properties p, final String k, final double dflt) {
+      final String v = p.getProperty(k);
+      return v != null ? Double.parseDouble(v.trim()) : dflt;
+    }
+
+    private static boolean boolProp(final Properties p, final String k, final boolean dflt) {
+      final String v = p.getProperty(k);
+      return v != null ? Boolean.parseBoolean(v.trim()) : dflt;
+    }
+
+    private static Boolean boolPropOrNull(final Properties p, final String k) {
+      final String v = p.getProperty(k);
+      return v != null ? Boolean.valueOf(Boolean.parseBoolean(v.trim())) : null;
+    }
+
+    private boolean touchesTable() {
+      return bloomBits >= 0 || cacheSize >= 0 || blockSize > 0
+          || cacheIndexAndFilterBlocks || pinL0FilterAndIndexBlocks;
+    }
+
+    // Builds the table config against the process-wide shared cache and filter. Called once per
+    // column family; the BlockBasedTableConfig itself is a plain value holder, but the Cache and
+    // Filter it points at must be the same native objects for every CF (and must outlive the DB).
+    private BlockBasedTableConfig tableConfig() {
+      final BlockBasedTableConfig tc = new BlockBasedTableConfig();
+      if (cacheSize == 0) {
+        // Matches db_bench --cache_size=0: no block cache. Index/filter blocks still live on the
+        // heap outside the cache, which is exactly the trap the 0612 campaign documented.
+        tc.setNoBlockCache(true);
+      } else if (cacheSize > 0) {
+        if (sharedBlockCache == null) {
+          // (capacity, numShardBits=-1 auto, strictCapacityLimit=false, highPriPoolRatio)
+          sharedBlockCache = new LRUCache(cacheSize, -1, false, cacheHighPriRatio);
+        }
+        tc.setBlockCache(sharedBlockCache);
+      }
+      if (bloomBits == 0) {
+        tc.setFilterPolicy(null);
+      } else if (bloomBits > 0) {
+        if (sharedFilterPolicy == null) {
+          sharedFilterPolicy = new BloomFilter(bloomBits);
+        }
+        tc.setFilterPolicy(sharedFilterPolicy);
+      }
+      tc.setCacheIndexAndFilterBlocks(cacheIndexAndFilterBlocks);
+      tc.setCacheIndexAndFilterBlocksWithHighPriority(cacheIndexAndFilterWithHighPriority);
+      tc.setPinL0FilterAndIndexBlocksInCache(pinL0FilterAndIndexBlocks);
+      if (blockSize > 0) {
+        tc.setBlockSize(blockSize);
+      }
+      return tc;
+    }
+
+    void applyTo(final ColumnFamilyOptions opts) {
+      if (writeBufferSize > 0) {
+        opts.setWriteBufferSize(writeBufferSize);
+      }
+      if (targetFileSizeBase > 0) {
+        opts.setTargetFileSizeBase(targetFileSizeBase);
+      }
+      if (maxBytesForLevelMultiplier > 0) {
+        opts.setMaxBytesForLevelMultiplier(maxBytesForLevelMultiplier);
+      }
+      if (levelDynamicBytes != null) {
+        opts.setLevelCompactionDynamicLevelBytes(levelDynamicBytes);
+      }
+      if (softPendingLimit >= 0) {
+        opts.setSoftPendingCompactionBytesLimit(softPendingLimit);
+      }
+      if (hardPendingLimit >= 0) {
+        opts.setHardPendingCompactionBytesLimit(hardPendingLimit);
+      }
+      if (touchesTable()) {
+        opts.setTableFormatConfig(tableConfig());
+      }
+    }
+
+    // Options implements the same CF interfaces but does not extend ColumnFamilyOptions, so the
+    // no-column-family open path needs its own overload.
+    void applyTo(final Options opts) {
+      if (writeBufferSize > 0) {
+        opts.setWriteBufferSize(writeBufferSize);
+      }
+      if (targetFileSizeBase > 0) {
+        opts.setTargetFileSizeBase(targetFileSizeBase);
+      }
+      if (maxBytesForLevelMultiplier > 0) {
+        opts.setMaxBytesForLevelMultiplier(maxBytesForLevelMultiplier);
+      }
+      if (levelDynamicBytes != null) {
+        opts.setLevelCompactionDynamicLevelBytes(levelDynamicBytes);
+      }
+      if (softPendingLimit >= 0) {
+        opts.setSoftPendingCompactionBytesLimit(softPendingLimit);
+      }
+      if (hardPendingLimit >= 0) {
+        opts.setHardPendingCompactionBytesLimit(hardPendingLimit);
+      }
+      if (touchesTable()) {
+        opts.setTableFormatConfig(tableConfig());
+      }
+    }
+
+    @Override
+    public String toString() {
+      return "writeBufferSize=" + writeBufferSize
+          + " targetFileSizeBase=" + targetFileSizeBase
+          + " maxBytesForLevelMultiplier=" + maxBytesForLevelMultiplier
+          + " levelDynamicBytes=" + levelDynamicBytes
+          + " softPendingLimit=" + softPendingLimit
+          + " hardPendingLimit=" + hardPendingLimit
+          + " bloomBits=" + bloomBits
+          + " cacheSize=" + cacheSize
+          + " cacheIndexAndFilterBlocks=" + cacheIndexAndFilterBlocks
+          + " pinL0FilterAndIndexBlocksInCache=" + pinL0FilterAndIndexBlocks
+          + " blockSize=" + blockSize
+          + " cacheHighPriRatio=" + cacheHighPriRatio
+          + " cacheIndexAndFilterWithHighPriority=" + cacheIndexAndFilterWithHighPriority;
+    }
+  }
+
+  // [YW-Custom] max_open_files decides whether index/filter blocks are effectively unbounded.
+  // RocksDB default is -1 (open every SST at DB::Open and never evict the readers), which with
+  // cache_index_and_filter_blocks=false means all index+filter stay resident on the heap.
+  // Made explicit so the memory regime is stated in the flags instead of inherited silently.
+  private static void applyMaxOpenFiles(final Options opts, final Properties props) {
+    final String v = props.getProperty("rocksdb.maxopenfiles");
+    if (v != null) {
+      opts.setMaxOpenFiles(Integer.parseInt(v.trim()));
+    }
+  }
+
+  private static void applyMaxOpenFiles(final DBOptions opts, final Properties props) {
+    final String v = props.getProperty("rocksdb.maxopenfiles");
+    if (v != null) {
+      opts.setMaxOpenFiles(Integer.parseInt(v.trim()));
+    }
+  }
+
+  // [YW-Custom] Memory ledger, printed once just before the DB closes.
+  //
+  // Why: with cache_index_and_filter_blocks=false (the db_bench convention this project inherited)
+  // index and filter blocks do NOT live in the block cache. They are owned by the open table
+  // readers and, since max_open_files defaults to -1, every SST is opened at DB::Open and stays
+  // open — so they are effectively unbounded heap. The block cache capacity then bounds only data
+  // blocks, which means "cache = C vs C+M" does not describe the real memory difference between
+  // the two systems. estimate-table-readers-mem is the number that does.
+  //
+  // Read this together with the ITBL interval table size (M) to get the total-metadata comparison
+  // the memory budget argument actually needs.
+  private static void logMemoryLedger() {
+    if (rocksDb == null) {
+      return;
+    }
+    final String[] props = {
+        "rocksdb.estimate-table-readers-mem",   // index + filter held by open table readers (heap)
+        "rocksdb.block-cache-usage",
+        "rocksdb.block-cache-capacity",
+        "rocksdb.block-cache-pinned-usage",
+        "rocksdb.estimate-num-keys",
+        "rocksdb.live-sst-files-size",
+        "rocksdb.num-files-at-level0",
+        "rocksdb.estimate-live-data-size",
+    };
+    final StringBuilder sb = new StringBuilder("[YW-Custom][MEM-LEDGER]");
+    for (final String p : props) {
+      String v;
+      try {
+        v = rocksDb.getProperty(p);
+      } catch (final RocksDBException e) {
+        v = "err";
+      }
+      sb.append(' ').append(p.replace("rocksdb.", "")).append('=').append(v);
+    }
+    LOGGER.info(sb.toString());
+    System.err.println(sb.toString());
+  }
+
+  // [YW-Custom] setCompressionType alone is not enough: compression_per_level, once populated,
+  // takes precedence, so a stale array would leave compression on at L2+. Write the whole array.
+  private static void applyCompression(final Options opts, final CompressionType compression,
+      final int numLevels) {
+    if (compression == null) {
+      return;
+    }
+    opts.setCompressionType(compression);
+    final int effectiveNumLevels = numLevels > 0 ? numLevels : 7;
+    final List<CompressionType> perLevel = new ArrayList<>(effectiveNumLevels);
+    for (int i = 0; i < effectiveNumLevels; i++) {
+      perLevel.add(compression);
+    }
+    opts.setCompressionPerLevel(perLevel);
+  }
+
+  private int parseIntProp(final String key, final int defaultValue) {
+    final String val = getProperties().getProperty(key);
+    return val != null ? Integer.parseInt(val) : defaultValue;
+  }
+
+  private long parseLongProp(final String key, final long defaultValue) {
+    final String val = getProperties().getProperty(key);
+    return val != null ? Long.parseLong(val) : defaultValue;
+  }
+
+
+  // [YW-Custom] Boolean prop: accepts "true"/"false" (case-insensitive). Anything else → defaultValue.
+  private boolean parseBoolProp(final String key, final boolean defaultValue) {
+    final String val = getProperties().getProperty(key);
+    if (val == null) {
+      return defaultValue;
+    }
+    return Boolean.parseBoolean(val);
+  }
+
+  // [YW-Custom] Compression prop: accepts RocksDB enum names (NO_COMPRESSION, SNAPPY_COMPRESSION,
+  // LZ4_COMPRESSION, ZSTD_COMPRESSION, etc.). Case-insensitive; falls back to defaultValue on unknown.
+  private CompressionType parseCompressionProp(final String key, final CompressionType defaultValue) {
+    final String val = getProperties().getProperty(key);
+    if (val == null) {
+      return defaultValue;
+    }
+    try {
+      return CompressionType.valueOf(val.trim().toUpperCase(Locale.ROOT));
+    } catch (final IllegalArgumentException e) {
+      LOGGER.warn("[YW-Custom] unknown rocksdb.compression value '" + val + "'; using default");
+      return defaultValue;
+    }
+  }
+
   @Override
   public void cleanup() throws DBException {
     super.cleanup();
@@ -182,6 +651,8 @@ public class RocksDBClient extends DB {
     synchronized (RocksDBClient.class) {
       try {
         if (references == 1) {
+          logMemoryLedger();
+
           for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
             cf.getHandle().close();
           }
@@ -191,6 +662,12 @@ public class RocksDBClient extends DB {
 
           dbOptions.close();
           dbOptions = null;
+
+          // [YW-Custom] release WriteOptions allocated in initRocksDB.
+          if (writeOptions != null) {
+            writeOptions.close();
+            writeOptions = null;
+          }
 
           for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
             cf.getOptions().close();
@@ -218,7 +695,7 @@ public class RocksDBClient extends DB {
       }
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      final byte[] values = rocksDb.get(cf, key.getBytes(UTF_8));
+      final byte[] values = rocksDb.get(cf, toRocksKey(key)); // [YW-Custom]
       if(values == null) {
         return Status.NOT_FOUND;
       }
@@ -241,7 +718,7 @@ public class RocksDBClient extends DB {
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
       try(final RocksIterator iterator = rocksDb.newIterator(cf)) {
         int iterations = 0;
-        for (iterator.seek(startkey.getBytes(UTF_8)); iterator.isValid() && iterations < recordcount;
+        for (iterator.seek(toRocksKey(startkey)); iterator.isValid() && iterations < recordcount; // [YW-Custom]
              iterator.next()) {
           final HashMap<String, ByteIterator> values = new HashMap<>();
           deserializeValues(iterator.value(), fields, values);
@@ -268,7 +745,7 @@ public class RocksDBClient extends DB {
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
       final Map<String, ByteIterator> result = new HashMap<>();
-      final byte[] currentValues = rocksDb.get(cf, key.getBytes(UTF_8));
+      final byte[] currentValues = rocksDb.get(cf, toRocksKey(key)); // [YW-Custom]
       if(currentValues == null) {
         return Status.NOT_FOUND;
       }
@@ -278,7 +755,7 @@ public class RocksDBClient extends DB {
       result.putAll(values);
 
       //store
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(result));
+      rocksDb.put(cf, writeOptions, toRocksKey(key), serializeValues(result)); // [YW-Custom]
 
       return Status.OK;
 
@@ -296,7 +773,7 @@ public class RocksDBClient extends DB {
       }
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(values));
+      rocksDb.put(cf, writeOptions, toRocksKey(key), serializeValues(values)); // [YW-Custom]
 
       return Status.OK;
     } catch(final RocksDBException | IOException e) {
@@ -313,7 +790,7 @@ public class RocksDBClient extends DB {
       }
 
       final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      rocksDb.delete(cf, key.getBytes(UTF_8));
+      rocksDb.delete(cf, writeOptions, toRocksKey(key)); // [YW-Custom]
 
       return Status.OK;
     } catch(final RocksDBException e) {
@@ -378,6 +855,16 @@ public class RocksDBClient extends DB {
     return result;
   }
 
+  // [YW-Custom] Hash YCSB string key to 16-byte binary key, equivalent to db_bench --random_byte_keys=1.
+  // All CRUD methods use this so load and run phases are consistent.
+  private static byte[] toRocksKey(final String key) {
+    try {
+      return MessageDigest.getInstance("MD5").digest(key.getBytes(UTF_8));
+    } catch (final NoSuchAlgorithmException e) {
+      throw new RuntimeException(e); // MD5 is always available in Java
+    }
+  }
+
   private byte[] serializeValues(final Map<String, ByteIterator> values) throws IOException {
     try(final ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
       final ByteBuffer buf = ByteBuffer.allocate(4);
@@ -434,7 +921,13 @@ public class RocksDBClient extends DB {
           // apply those options to this column family
           cfOptions = getDefaultColumnFamilyOptions(name);
         } else {
-          cfOptions = new ColumnFamilyOptions().optimizeLevelStyleCompaction();
+          // [YW-Custom] optimizeLevelStyleCompaction() removed 2026-09 — see initRocksDB().
+          cfOptions = new ColumnFamilyOptions();
+          // [YW-Custom] Apply all CF options configured at open time (num_levels, L0 thresholds, etc.).
+          new CfOpts(cfNumLevels, cfMaxBytesForLevelBase,
+              cfLevel0CompactionTrigger, cfLevel0SlowdownTrigger, cfLevel0StopTrigger,
+              cfMaxWriteBufferNumber, cfCompression).applyTo(cfOptions);
+          cfExtra.applyTo(cfOptions);
         }
 
         final ColumnFamilyHandle cfHandle = rocksDb.createColumnFamily(
