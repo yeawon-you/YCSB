@@ -579,18 +579,30 @@ public class RocksDBClient extends DB {
         "rocksdb.num-files-at-level0",
         "rocksdb.estimate-live-data-size",
     };
-    final StringBuilder sb = new StringBuilder("[YW-Custom][MEM-LEDGER]");
+    // CF-scoped properties need the column family handle. YCSB writes into a CF named after the
+    // table ("usertable"), created lazily in createColumnFamily(), so querying without a handle
+    // hits the empty default CF and returns 0 for every SST/table-reader figure.
+    for (final Map.Entry<String, ColumnFamily> e : COLUMN_FAMILIES.entrySet()) {
+      emitLedger(e.getKey(), e.getValue().getHandle(), props);
+    }
+    // Default CF too, so the line set is complete even when no named CF was created.
+    emitLedger("default", null, props);
+  }
+
+  private static void emitLedger(final String cfName, final ColumnFamilyHandle cf,
+      final String[] props) {
+    final StringBuilder sb = new StringBuilder("[YW-Custom][MEM-LEDGER] cf=").append(cfName);
     for (final String p : props) {
       String v;
       try {
-        v = rocksDb.getProperty(p);
+        v = cf == null ? rocksDb.getProperty(p) : rocksDb.getProperty(cf, p);
       } catch (final RocksDBException e) {
         v = "err";
       }
       sb.append(' ').append(p.replace("rocksdb.", "")).append('=').append(v);
     }
+    // LOGGER writes to stderr under slf4j-simple; a second System.err.println duplicates the line.
     LOGGER.info(sb.toString());
-    System.err.println(sb.toString());
   }
 
   // [YW-Custom] setCompressionType alone is not enough: compression_per_level, once populated,
