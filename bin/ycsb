@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) 2012 - 2020 YCSB contributors. All rights reserved.
 #
@@ -212,16 +212,32 @@ def is_distribution():
 # presumes maven properly handles system-specific path separators
 # Given module is full module name eg. 'core' or 'couchbase-binding'
 def get_classpath_from_maven(module):
+    # [YW-Custom] Cache classpath to avoid concurrent mvn races across parallel YCSB invocations.
+    # Without this, N>=2 simultaneous `bin/ycsb` calls each kick off `mvn package`, which then
+    # collide on `target/classes/` (mvn-jar-plugin can fail with "RocksDBClient.class not found"
+    # when another mvn is mid-rebuild). Cache is per-uid because the resolved classpath includes
+    # user-specific .m2 paths.
+    cache_file = "/tmp/ycsb_classpath_" + module + "_uid" + str(os.geteuid()) + ".cp"
+    if os.environ.get("YCSB_CLASSPATH_NOCACHE") != "1" and os.path.exists(cache_file):
+        try:
+            with open(cache_file) as f:
+                cached = f.read().strip()
+            if cached and ":" in cached:
+                debug("[YW-Custom] Reusing cached classpath from " + cache_file)
+                return cached
+        except IOError:
+            pass
+
     output_file = tempfile.NamedTemporaryFile(delete=True)
     cmd = ["mvn", "-B", "-pl", "site.ycsb:" + module,
-           "-am", "package", "-DskipTests",
+           "-am", "package", "-Dmaven.test.skip=true",
            "dependency:list",
            "-DoutputAbsoluteArtifactFilename",
            "-DappendOutput=false",
            "-DoutputFile=" + output_file.name
            ]
     debug("Running '" + " ".join(cmd) + "'")
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, cwd=get_ycsb_home())
 
     # the output file will now contain all of the dependencies in the format:
     # group:artifact:type:[classifier:]version:scope:path[ -- module info]
@@ -235,7 +251,20 @@ def get_classpath_from_maven(module):
             if m.groupdict()["scope"] == "test":
                 continue
             classpath_items.append(m.groupdict()["path"])
-    return ":".join(classpath_items)
+
+    result = ":".join(classpath_items)
+
+    # [YW-Custom] Save to cache for subsequent invocations. If two concurrent first-time callers
+    # race here, last-writer-wins and both produce the same content (deterministic mvn output),
+    # so the race is benign.
+    try:
+        with open(cache_file, "w") as f:
+            f.write(result)
+        debug("[YW-Custom] Cached classpath at " + cache_file)
+    except IOError:
+        pass
+
+    return result
 
 
 def main():

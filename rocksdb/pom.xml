@@ -34,6 +34,7 @@ LICENSE file.
       <groupId>org.rocksdb</groupId>
       <artifactId>rocksdbjni</artifactId>
       <version>${rocksdb.version}</version>
+      <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>site.ycsb</groupId>
