@@ -79,6 +79,11 @@ public class RocksDBClient extends DB {
   // [YW-Custom] WriteOptions reused for every put/delete; set during init based on rocksdb.disablewal.
   @GuardedBy("RocksDBClient.class") private static WriteOptions writeOptions = null;
 
+  // [YW-Custom] Optional statistics object (rocksdb.statistics=true). Kept strongly referenced for the
+  // DB lifetime; dumped to stderr once at close via toString() so ticker names come from the native
+  // side (the two forks' C++ ticker enums differ, so Java TickerType byte values are not trusted).
+  @GuardedBy("RocksDBClient.class") private static Statistics sharedStatistics = null;
+
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
 
@@ -270,8 +275,11 @@ public class RocksDBClient extends DB {
       // [YW-Custom] memtable / level geometry / block cache / bloom filter.
       cfExtra.applyTo(options);
       applyMaxOpenFiles(options, getProperties());
+      applyObservability(options, getProperties());
       dbOptions = options;
-      return RocksDB.open(options, rocksDbDir.toAbsolutePath().toString());
+      final RocksDB db = RocksDB.open(options, rocksDbDir.toAbsolutePath().toString());
+      maybeQuiesce(db, getProperties());
+      return db;
     } else {
       final DBOptions options = new DBOptions()
           .setCreateIfMissing(true)
@@ -290,6 +298,7 @@ public class RocksDBClient extends DB {
         options.setUseDirectIoForFlushAndCompaction(true);
       }
       applyMaxOpenFiles(options, getProperties());
+      applyObservability(options, getProperties());
       dbOptions = options;
 
       final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
@@ -297,6 +306,7 @@ public class RocksDBClient extends DB {
       for(int i = 0; i < cfNames.size(); i++) {
         COLUMN_FAMILIES.put(cfNames.get(i), new ColumnFamily(cfHandles.get(i), cfOptionss.get(i)));
       }
+      maybeQuiesce(db, getProperties());
       return db;
     }
   }
@@ -547,6 +557,90 @@ public class RocksDBClient extends DB {
     }
   }
 
+  // [YW-Custom] Observability knobs (2026-09-23, trial 2).
+  //   rocksdb.statistics=true        → Statistics (default level), dumped at close
+  //   rocksdb.statsdumpperiodsec=N   → LOG stats dump period (ITBL GC-STATS rides on it)
+  private static void applyObservability(final Options opts, final Properties props) {
+    final String sd = props.getProperty("rocksdb.statsdumpperiodsec");
+    if (sd != null) {
+      opts.setStatsDumpPeriodSec(Integer.parseInt(sd.trim()));
+    }
+    if (Boolean.parseBoolean(props.getProperty("rocksdb.statistics", "false"))) {
+      sharedStatistics = new Statistics();
+      opts.setStatistics(sharedStatistics);
+    }
+  }
+
+  private static void applyObservability(final DBOptions opts, final Properties props) {
+    final String sd = props.getProperty("rocksdb.statsdumpperiodsec");
+    if (sd != null) {
+      opts.setStatsDumpPeriodSec(Integer.parseInt(sd.trim()));
+    }
+    if (Boolean.parseBoolean(props.getProperty("rocksdb.statistics", "false"))) {
+      sharedStatistics = new Statistics();
+      opts.setStatistics(sharedStatistics);
+    }
+  }
+
+  // [YW-Custom] Quiesce (2026-09-23, trial 2): with rocksdb.quiesceonopen=true, block after open until
+  // no flush/compaction is pending or running for rocksdb.quiesce.stablesecs (default 10) consecutive
+  // seconds, or rocksdb.quiesce.timeoutsecs (default 7200) elapses. RocksJava 8.10 has no
+  // waitForCompact, so this polls the same properties DB::WaitForCompact would observe. Used by the
+  // harness as a separate, unmeasured invocation between load and run phases so both systems start
+  // every measured phase with no compaction debt carried over.
+  private static void maybeQuiesce(final RocksDB db, final Properties props) {
+    if (!Boolean.parseBoolean(props.getProperty("rocksdb.quiesceonopen", "false"))) {
+      return;
+    }
+    final int stableNeed = Integer.parseInt(props.getProperty("rocksdb.quiesce.stablesecs", "10").trim());
+    final int timeout = Integer.parseInt(props.getProperty("rocksdb.quiesce.timeoutsecs", "7200").trim());
+    final long t0 = System.nanoTime();
+    int stable = 0;
+    long lastLog = -1;
+    while (true) {
+      final long el = (System.nanoTime() - t0) / 1_000_000_000L;
+      long pending = 0;
+      long running = 0;
+      long flushes = 0;
+      long memPending = 0;
+      try {
+        running = db.getLongProperty("rocksdb.num-running-compactions");
+        flushes = db.getLongProperty("rocksdb.num-running-flushes");
+        for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
+          pending += db.getLongProperty(cf.getHandle(), "rocksdb.compaction-pending");
+          memPending += db.getLongProperty(cf.getHandle(), "rocksdb.mem-table-flush-pending");
+        }
+        pending += db.getLongProperty("rocksdb.compaction-pending");
+        memPending += db.getLongProperty("rocksdb.mem-table-flush-pending");
+      } catch (final RocksDBException e) {
+        LOGGER.warn("[YW-Custom][QUIESCE] property read failed: " + e.getMessage());
+      }
+      final boolean idle = pending == 0 && running == 0 && flushes == 0 && memPending == 0;
+      stable = idle ? stable + 1 : 0;
+      if (el / 30 != lastLog) {
+        lastLog = el / 30;
+        LOGGER.info("[YW-Custom][QUIESCE] t={}s compaction_pending={} running_compactions={} "
+            + "running_flushes={} memtable_flush_pending={} stable={}s",
+            el, pending, running, flushes, memPending, stable);
+      }
+      if (stable >= stableNeed) {
+        LOGGER.info("[YW-Custom][QUIESCE] done after {}s", el);
+        return;
+      }
+      if (el >= timeout) {
+        LOGGER.warn("[YW-Custom][QUIESCE] TIMEOUT after {}s (pending={} running={}) - proceeding",
+            el, pending, running);
+        return;
+      }
+      try {
+        Thread.sleep(1000);
+      } catch (final InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+    }
+  }
+
   private static void applyMaxOpenFiles(final DBOptions opts, final Properties props) {
     final String v = props.getProperty("rocksdb.maxopenfiles");
     if (v != null) {
@@ -664,6 +758,11 @@ public class RocksDBClient extends DB {
       try {
         if (references == 1) {
           logMemoryLedger();
+          if (sharedStatistics != null) {
+            for (final String line : sharedStatistics.toString().split("\n")) {
+              LOGGER.info("[YW-Custom][STATS] " + line);
+            }
+          }
 
           for (final ColumnFamily cf : COLUMN_FAMILIES.values()) {
             cf.getHandle().close();
