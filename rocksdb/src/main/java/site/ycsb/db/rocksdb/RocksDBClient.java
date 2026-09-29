@@ -85,6 +85,9 @@ public class RocksDBClient extends DB {
   @GuardedBy("RocksDBClient.class") private static Statistics sharedStatistics = null;
 
   private static final ConcurrentMap<String, ColumnFamily> COLUMN_FAMILIES = new ConcurrentHashMap<>();
+
+  // [YW-Custom][BREAKDOWN] y2 (DS_ARM_y2 4.5): this client thread's breakdown state, null when off.
+  private RocksDBBreakdown.Tls bd = null;
   private static final ConcurrentMap<String, Lock> COLUMN_FAMILY_LOCKS = new ConcurrentHashMap<>();
 
   @Override
@@ -112,6 +115,10 @@ public class RocksDBClient extends DB {
       }
 
       references++;
+    }
+    // [YW-Custom][BREAKDOWN] PerfLevel / PerfContext are thread-local: attach on the client thread.
+    if (RocksDBBreakdown.isEnabled()) {
+      bd = RocksDBBreakdown.attach(rocksDb);
     }
   }
 
@@ -390,6 +397,9 @@ public class RocksDBClient extends DB {
     private final long blockSize;
     private final double cacheHighPriRatio;
     private final boolean cacheIndexAndFilterWithHighPriority;
+    // [YW-Custom][BREAKDOWN] y2: report_bg_io_stats (file write / fsync nanos in the flush and
+    // compaction EVENT_LOG lines) whenever rocksdb.breakdown=true.
+    private final boolean reportBgIoStats;
 
     // Empty holder used before init(); every field is "leave the RocksDB default alone".
     YwExtraOpts() {
@@ -418,6 +428,7 @@ public class RocksDBClient extends DB {
       this.cacheHighPriRatio = doubleProp(props, "rocksdb.cachehighpriratio", 0.0);
       this.cacheIndexAndFilterWithHighPriority =
           boolProp(props, "rocksdb.cacheindexandfilterblockswithhighpriority", true);
+      this.reportBgIoStats = RocksDBBreakdown.requested(props);
     }
 
     private static long longProp(final Properties p, final String k, final long dflt) {
@@ -479,6 +490,9 @@ public class RocksDBClient extends DB {
     }
 
     void applyTo(final ColumnFamilyOptions opts) {
+      if (reportBgIoStats) {
+        opts.setReportBgIoStats(true);
+      }
       if (writeBufferSize > 0) {
         opts.setWriteBufferSize(writeBufferSize);
       }
@@ -505,6 +519,9 @@ public class RocksDBClient extends DB {
     // Options implements the same CF interfaces but does not extend ColumnFamilyOptions, so the
     // no-column-family open path needs its own overload.
     void applyTo(final Options opts) {
+      if (reportBgIoStats) {
+        opts.setReportBgIoStats(true);
+      }
       if (writeBufferSize > 0) {
         opts.setWriteBufferSize(writeBufferSize);
       }
@@ -569,6 +586,7 @@ public class RocksDBClient extends DB {
       sharedStatistics = new Statistics();
       opts.setStatistics(sharedStatistics);
     }
+    RocksDBBreakdown.start(props, sharedStatistics); // [YW-Custom][BREAKDOWN] no-op unless requested
   }
 
   private static void applyObservability(final DBOptions opts, final Properties props) {
@@ -580,6 +598,7 @@ public class RocksDBClient extends DB {
       sharedStatistics = new Statistics();
       opts.setStatistics(sharedStatistics);
     }
+    RocksDBBreakdown.start(props, sharedStatistics); // [YW-Custom][BREAKDOWN] no-op unless requested
   }
 
   // [YW-Custom] Quiesce (2026-09-23, trial 2): with rocksdb.quiesceonopen=true, block after open until
@@ -754,9 +773,16 @@ public class RocksDBClient extends DB {
   public void cleanup() throws DBException {
     super.cleanup();
 
+    // [YW-Custom][BREAKDOWN] hand off this thread's last second before the last client stops the writer.
+    if (bd != null) {
+      bd.flush();
+      bd = null;
+    }
+
     synchronized (RocksDBClient.class) {
       try {
         if (references == 1) {
+          RocksDBBreakdown.stop();
           logMemoryLedger();
           if (sharedStatistics != null) {
             for (final String line : sharedStatistics.toString().split("\n")) {
@@ -800,6 +826,9 @@ public class RocksDBClient extends DB {
   @Override
   public Status read(final String table, final String key, final Set<String> fields,
       final Map<String, ByteIterator> result) {
+    if (bd != null) {
+      return readBd(table, key, fields, result);
+    }
     try {
       if (!COLUMN_FAMILIES.containsKey(table)) {
         createColumnFamily(table);
@@ -821,6 +850,9 @@ public class RocksDBClient extends DB {
   @Override
   public Status scan(final String table, final String startkey, final int recordcount, final Set<String> fields,
         final Vector<HashMap<String, ByteIterator>> result) {
+    if (bd != null) {
+      return scanBd(table, startkey, recordcount, fields, result);
+    }
     try {
       if (!COLUMN_FAMILIES.containsKey(table)) {
         createColumnFamily(table);
@@ -849,6 +881,9 @@ public class RocksDBClient extends DB {
   public Status update(final String table, final String key, final Map<String, ByteIterator> values) {
     //TODO(AR) consider if this would be faster with merge operator
 
+    if (bd != null) {
+      return updateBd(table, key, values);
+    }
     try {
       if (!COLUMN_FAMILIES.containsKey(table)) {
         createColumnFamily(table);
@@ -878,6 +913,9 @@ public class RocksDBClient extends DB {
 
   @Override
   public Status insert(final String table, final String key, final Map<String, ByteIterator> values) {
+    if (bd != null) {
+      return insertBd(table, key, values);
+    }
     try {
       if (!COLUMN_FAMILIES.containsKey(table)) {
         createColumnFamily(table);
@@ -895,6 +933,9 @@ public class RocksDBClient extends DB {
 
   @Override
   public Status delete(final String table, final String key) {
+    if (bd != null) {
+      return deleteBd(table, key);
+    }
     try {
       if (!COLUMN_FAMILIES.containsKey(table)) {
         createColumnFamily(table);
@@ -907,6 +948,199 @@ public class RocksDBClient extends DB {
     } catch(final RocksDBException e) {
       LOGGER.error(e.getMessage(), e);
       return Status.ERROR;
+    }
+  }
+
+
+  // [YW-Custom][BREAKDOWN] y2 instrumented copies of read/scan/update/insert/delete (DS_ARM_y2 4.5).
+  // Same RocksDB calls in the same order as the plain methods above; each segment is timed with
+  // System.nanoTime and the call ends with one PerfContext snapshot (RocksDBBreakdown.Tls.end).
+  // op_total covers the whole binding call; op_total - segments = binding bookkeeping (CF lookup,
+  // timer reads). YCSB's own latency also includes DBWrapper and the snapshot itself.
+
+  private Status readBd(final String table, final String key, final Set<String> fields,
+      final Map<String, ByteIterator> result) {
+    final long t0 = System.nanoTime();
+    try {
+      if (!COLUMN_FAMILIES.containsKey(table)) {
+        createColumnFamily(table);
+      }
+      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      long a = System.nanoTime();
+      final byte[] k = toRocksKey(key);
+      long b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_KEY, b - a);
+      final byte[] values = rocksDb.get(cf, k);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_GET, a - b);
+      if (values == null) {
+        return Status.NOT_FOUND;
+      }
+      deserializeValues(values, fields, result);
+      b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_DESER, b - a);
+      return Status.OK;
+    } catch (final RocksDBException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    } finally {
+      bd.end(RocksDBBreakdown.OP_READ, t0, System.nanoTime());
+    }
+  }
+
+  private Status scanBd(final String table, final String startkey, final int recordcount,
+      final Set<String> fields, final Vector<HashMap<String, ByteIterator>> result) {
+    final long t0 = System.nanoTime();
+    try {
+      if (!COLUMN_FAMILIES.containsKey(table)) {
+        createColumnFamily(table);
+      }
+      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      long a = System.nanoTime();
+      final byte[] k = toRocksKey(startkey);
+      long b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_KEY, b - a);
+      final RocksIterator iterator = rocksDb.newIterator(cf);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_ITER_NEW, a - b);
+      int iterations = 0;
+      try {
+        iterator.seek(k);
+        b = System.nanoTime();
+        bd.add(RocksDBBreakdown.SEG_SEEK, b - a);
+        // Same call sequence as the plain loop: isValid, (row, next)*, and the final isValid.
+        long next = 0;
+        long value = 0;
+        long deser = 0;
+        a = b;
+        while (true) {
+          final boolean valid = iterator.isValid();
+          if (!valid || iterations >= recordcount) {
+            b = System.nanoTime();
+            next += b - a;
+            break;
+          }
+          b = System.nanoTime();
+          next += b - a;
+          final byte[] v = iterator.value();
+          a = System.nanoTime();
+          value += a - b;
+          final HashMap<String, ByteIterator> values = new HashMap<>();
+          deserializeValues(v, fields, values);
+          result.add(values);
+          b = System.nanoTime();
+          deser += b - a;
+          iterations++;
+          iterator.next();
+          a = System.nanoTime();
+          next += a - b;
+        }
+        bd.add(RocksDBBreakdown.SEG_NEXT, next);
+        bd.add(RocksDBBreakdown.SEG_VALUE, value);
+        bd.add(RocksDBBreakdown.SEG_SCAN_DESER, deser);
+        bd.add(RocksDBBreakdown.SEG_ROWS, iterations);
+      } finally {
+        a = System.nanoTime();
+        iterator.close();
+        bd.add(RocksDBBreakdown.SEG_ITER_CLOSE, System.nanoTime() - a);
+      }
+      return Status.OK;
+    } catch (final RocksDBException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    } finally {
+      bd.end(RocksDBBreakdown.OP_SCAN, t0, System.nanoTime());
+    }
+  }
+
+  private Status updateBd(final String table, final String key, final Map<String, ByteIterator> values) {
+    final long t0 = System.nanoTime();
+    try {
+      if (!COLUMN_FAMILIES.containsKey(table)) {
+        createColumnFamily(table);
+      }
+      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      final Map<String, ByteIterator> result = new HashMap<>();
+      long a = System.nanoTime();
+      final byte[] k1 = toRocksKey(key);
+      long b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_KEY, b - a);
+      final byte[] currentValues = rocksDb.get(cf, k1);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_GET, a - b);
+      if (currentValues == null) {
+        return Status.NOT_FOUND;
+      }
+      deserializeValues(currentValues, null, result);
+      b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_DESER, b - a);
+      result.putAll(values);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_MERGE, a - b);
+      final byte[] k2 = toRocksKey(key);
+      b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_KEY, b - a);
+      final byte[] sv = serializeValues(result);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_SER, a - b);
+      rocksDb.put(cf, writeOptions, k2, sv);
+      b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_PUT, b - a);
+      return Status.OK;
+    } catch (final RocksDBException | IOException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    } finally {
+      bd.end(RocksDBBreakdown.OP_UPDATE, t0, System.nanoTime());
+    }
+  }
+
+  private Status insertBd(final String table, final String key, final Map<String, ByteIterator> values) {
+    final long t0 = System.nanoTime();
+    try {
+      if (!COLUMN_FAMILIES.containsKey(table)) {
+        createColumnFamily(table);
+      }
+      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      long a = System.nanoTime();
+      final byte[] k = toRocksKey(key);
+      long b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_KEY, b - a);
+      final byte[] sv = serializeValues(values);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_SER, a - b);
+      rocksDb.put(cf, writeOptions, k, sv);
+      b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_PUT, b - a);
+      return Status.OK;
+    } catch (final RocksDBException | IOException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    } finally {
+      bd.end(RocksDBBreakdown.OP_INSERT, t0, System.nanoTime());
+    }
+  }
+
+  private Status deleteBd(final String table, final String key) {
+    final long t0 = System.nanoTime();
+    try {
+      if (!COLUMN_FAMILIES.containsKey(table)) {
+        createColumnFamily(table);
+      }
+      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
+      long a = System.nanoTime();
+      final byte[] k = toRocksKey(key);
+      long b = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_KEY, b - a);
+      rocksDb.delete(cf, writeOptions, k);
+      a = System.nanoTime();
+      bd.add(RocksDBBreakdown.SEG_DELETE, a - b);
+      return Status.OK;
+    } catch (final RocksDBException e) {
+      LOGGER.error(e.getMessage(), e);
+      return Status.ERROR;
+    } finally {
+      bd.end(RocksDBBreakdown.OP_DELETE, t0, System.nanoTime());
     }
   }
 
